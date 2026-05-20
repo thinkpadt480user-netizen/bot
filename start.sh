@@ -1,1 +1,5 @@
-python3 discord_username_checker_combined.py
+#!/bin/sh
+
+pip install aiohttp
+
+python main.py

@@ -1,5 +1,9 @@
 #!/bin/sh
 
-pip install aiohttp
+apt update
 
-python main.py
+apt install -y python3 python3-pip
+
+pip3 install aiohttp
+
+python3 main.py

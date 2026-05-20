@@ -116,7 +116,7 @@ class UsernameChecker:
     async def create_webhook_message(self, session):
 
         payload = {
-            "content": "## 🚀 STARTING USERNAME CHECKER..."
+            "content": "# 🚀 INITIALIZING USERNAME HUNTER..."
         }
 
         try:
@@ -169,13 +169,23 @@ class UsernameChecker:
 
         payload = {
             "content": (
-                f"## ✅ USERNAME FOUND\n\n"
-                f"**Username:** `{username}`\n"
-                f"**Checked:** `{self.stats.checked:,}`\n"
-                f"**Speed:** `{self.stats.checks_per_second():.2f}/sec`\n"
-                f"**Runtime:** `{self.stats.elapsed_time()}`\n"
-                f"**Length:** `{USERNAME_LENGTH}`\n"
-                f"**Time Found:** `{datetime.now()}`"
+                f"# ⚔️ USERNAME SECURED\n\n"
+
+                f"## 📊 SESSION STATS\n"
+                f"> **Checked:** `{self.stats.checked:,}`\n"
+                f"> **Speed:** `{self.stats.checks_per_second():.2f}/sec`\n"
+                f"> **Runtime:** `{self.stats.elapsed_time()}`\n"
+                f"> **Workers:** `{CONCURRENCY}`\n"
+                f"> **Length:** `{USERNAME_LENGTH}`\n"
+                f"> **Charset:** `{'letters+numbers' if USE_NUMBERS else 'letters only'}`\n\n"
+
+                f"## 🎯 USERNAME FOUND\n"
+                f"> **Username:** `{username}`\n"
+                f"> **Time:** `{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}`\n\n"
+
+                f"```ansi\n"
+                f"\u001b[1;32mTARGET ACQUIRED SUCCESSFULLY\u001b[0m\n"
+                f"```"
             )
         }
 
@@ -218,14 +228,12 @@ class UsernameChecker:
 
                     self.stats.record_check()
 
-                    # CONSOLE STATS
+                    # CONSOLE LIVE STATS
                     print(
-                        f"\rChecked: {self.stats.checked:,} | "
-                        f"Status: {response.status} | "
-                        f"Speed: "
-                        f"{self.stats.checks_per_second():.2f}/sec | "
-                        f"Runtime: "
-                        f"{self.stats.elapsed_time()}",
+                        f"\r[CHECKED: {self.stats.checked:,}] "
+                        f"[STATUS: {response.status}] "
+                        f"[SPEED: {self.stats.checks_per_second():.2f}/s] "
+                        f"[TIME: {self.stats.elapsed_time()}]",
                         end=""
                     )
 
@@ -286,7 +294,6 @@ class UsernameChecker:
 
             # =================================================
             # TESTING MODE
-            # Uncomment this to fake-find usernames
             # =================================================
 
             # available = random.randint(1, 1000) == 1
@@ -295,7 +302,7 @@ class UsernameChecker:
 
                 print("\n" + "=" * 60)
                 print(
-                    f"FOUND AVAILABLE USERNAME: "
+                    f"⚔️ FOUND AVAILABLE USERNAME: "
                     f"{username}"
                 )
                 print("=" * 60)
@@ -329,21 +336,29 @@ class UsernameChecker:
             cps = self.stats.checks_per_second()
 
             msg = (
-                f"## 📊 USERNAME CHECKER RUNNING\n\n"
-                f"**Checked:** `{self.stats.checked:,}`\n"
-                f"**Speed:** `{cps:.2f}/sec`\n"
-                f"**Runtime:** `{self.stats.elapsed_time()}`\n"
-                f"**Workers:** `{CONCURRENCY}`\n"
-                f"**Username Length:** `{USERNAME_LENGTH}`\n"
-                f"**Charset:** `{'letters+numbers' if USE_NUMBERS else 'letters only'}`"
+                f"# 📡 LIVE HUNT STATUS\n\n"
+
+                f"## 📊 SESSION STATS\n"
+                f"> **Checked:** `{self.stats.checked:,}`\n"
+                f"> **Speed:** `{cps:.2f}/sec`\n"
+                f"> **Runtime:** `{self.stats.elapsed_time()}`\n\n"
+
+                f"## ⚙️ CONFIGURATION\n"
+                f"> **Workers:** `{CONCURRENCY}`\n"
+                f"> **Username Length:** `{USERNAME_LENGTH}`\n"
+                f"> **Charset:** `{'letters+numbers' if USE_NUMBERS else 'letters only'}`\n\n"
+
+                f"```ansi\n"
+                f"\u001b[1;34mSCANNING DISCORD USERNAMES...\u001b[0m\n"
+                f"```"
             )
 
-            # CONSOLE
+            # CONSOLE OUTPUT
             console_msg = (
                 f"\r"
-                f"Checked: {self.stats.checked:,} | "
-                f"Speed: {cps:.2f}/sec | "
-                f"Runtime: {self.stats.elapsed_time()}"
+                f"[CHECKED: {self.stats.checked:,}] "
+                f"[SPEED: {cps:.2f}/s] "
+                f"[RUNTIME: {self.stats.elapsed_time()}]"
             )
 
             sys.stdout.write(console_msg)
@@ -366,7 +381,7 @@ class UsernameChecker:
         self.setup_signals()
 
         print("=" * 60)
-        print("Discord Username Checker")
+        print("⚔️ DISCORD USERNAME HUNTER")
         print("=" * 60)
 
         connector = aiohttp.TCPConnector(

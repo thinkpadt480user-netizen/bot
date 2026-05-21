@@ -1,428 +1,229 @@
 import asyncio
 import aiohttp
-import random
 import string
 import time
 import sys
 import signal
 from collections import deque
 from datetime import datetime
+from itertools import product
 
 # =========================================================
 # CONFIG
 # =========================================================
 
-CONCURRENCY = 50
+CONCURRENCY = 80          # Increased (Discord tolerates ~ this with good backoff)
 USERNAME_LENGTH = 4
 USE_NUMBERS = True
+SAVE_FILE = "found.txt"
+PROGRESS_FILE = "progress.txt"  # For resuming
 
-# =========================================================
-# WEBHOOKS
-# =========================================================
-
+# Webhooks
 STATS_WEBHOOK_URL = "https://discord.com/api/webhooks/1506778294983327774/Gs4U0KXsTVblV9LQIt5X340KsxiNZtwvRU_ipeCzm0LeU1Q5ASrCyzM-98bFwGYy0tX5"
 DROPS_WEBHOOK_URL = "https://discord.com/api/webhooks/1506803035592986784/rtdrRvkPOzTQQCJOhi7zywWOIV7vrEMCAHzJA2EWk-uymDzEcU0cmfPxgzkQNGnd8hxJ"
 
-SAVE_FILE = "found.txt"
-
 API_URL = "https://discord.com/api/v9/unique-username/username-attempt-unauthed"
 
-MAX_RETRIES = 3
-BASE_BACKOFF = 1
+MAX_RETRIES = 5
+BASE_BACKOFF = 0.8
 
 # =========================================================
-# STATS TRACKER
+# STATS
 # =========================================================
 
 class StatsTracker:
-
     def __init__(self):
         self.checked = 0
         self.start_time = time.time()
-        self.timestamps = deque(maxlen=500)
+        self.timestamps = deque(maxlen=1000)
+        self.found = 0
 
     def record_check(self):
         self.checked += 1
         self.timestamps.append(time.time())
 
-    def checks_per_second(self):
-
-        if len(self.timestamps) < 2:
+    def cps(self):
+        if len(self.timestamps) < 10:
             return 0.0
-
         elapsed = self.timestamps[-1] - self.timestamps[0]
+        return len(self.timestamps) / elapsed if elapsed > 0 else 0.0
 
-        if elapsed <= 0:
-            return 0.0
+    def elapsed(self):
+        secs = int(time.time() - self.start_time)
+        h, m, s = secs // 3600, (secs % 3600) // 60, secs % 60
+        return f"{h:02d}:{m:02d}:{s:02d}"
 
-        return len(self.timestamps) / elapsed
-
-    def elapsed_time(self):
-
-        seconds = int(time.time() - self.start_time)
-
-        hours = seconds // 3600
-        minutes = (seconds % 3600) // 60
-        secs = seconds % 60
-
-        if hours > 0:
-            return f"{hours:02d}:{minutes:02d}:{secs:02d}"
-
-        return f"{minutes:02d}:{secs:02d}"
 
 # =========================================================
 # MAIN CHECKER
 # =========================================================
 
 class UsernameChecker:
-
     def __init__(self):
-
         self.running = True
-
         self.stats = StatsTracker()
-
-        self.checked_usernames = set()
-
         self.webhook_message_id = None
+        self.session = None
 
-        if USE_NUMBERS:
-            self.charset = string.ascii_lowercase + string.digits
-        else:
-            self.charset = string.ascii_lowercase
+        self.charset = string.ascii_lowercase + (string.digits if USE_NUMBERS else "")
+        self.generator = self.username_generator()
 
-    # =====================================================
-    # CTRL+C HANDLER
-    # =====================================================
+        # Load progress if exists
+        self.tried = self.load_progress()
+
+    def username_generator(self):
+        """Systematic generator - no duplicates"""
+        for combo in product(self.charset, repeat=USERNAME_LENGTH):
+            yield ''.join(combo)
+
+    def load_progress(self):
+        try:
+            with open(PROGRESS_FILE, "r") as f:
+                return set(line.strip() for line in f if line.strip())
+        except FileNotFoundError:
+            return set()
+
+    def save_progress(self, username):
+        with open(PROGRESS_FILE, "a") as f:
+            f.write(username + "\n")
 
     def setup_signals(self):
-
-        def stop(sig, frame):
+        def stop(*_):
             self.running = False
-            print("\nStopping...")
-
+            print("\n\nStopping gracefully...")
         signal.signal(signal.SIGINT, stop)
 
-    # =====================================================
-    # GENERATE USERNAME
-    # =====================================================
-
-    def generate_username(self):
-
-        return ''.join(
-            random.choice(self.charset)
-            for _ in range(USERNAME_LENGTH)
-        )
-
-    # =====================================================
-    # CREATE WEBHOOK MESSAGE
-    # =====================================================
-
-    async def create_webhook_message(self, session):
-
-        payload = {
-            "content": "## 🚀 STARTING USERNAME CHECKER..."
-        }
-
+    async def create_webhook_message(self):
+        payload = {"content": "## 🚀 **USERNAME SNIPER STARTED**"}
         try:
-
-            async with session.post(
-                STATS_WEBHOOK_URL + "?wait=true",
-                json=payload
-            ) as response:
-
-                data = await response.json()
-
-                self.webhook_message_id = data["id"]
-
-                print(
-                    f"\nCreated Webhook Message ID: "
-                    f"{self.webhook_message_id}"
-                )
-
+            async with self.session.post(STATS_WEBHOOK_URL + "?wait=true", json=payload) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    self.webhook_message_id = data.get("id")
         except Exception as e:
+            print(f"Webhook init failed: {e}")
 
-            print(f"\nCreate Webhook Error: {e}")
-
-    # =====================================================
-    # EDIT WEBHOOK MESSAGE
-    # =====================================================
-
-    async def edit_webhook_message(self, session, content):
-
-        if not self.webhook_message_id:
-            return
-
-        try:
-
-            async with session.patch(
-                f"{STATS_WEBHOOK_URL}/messages/{self.webhook_message_id}",
-                json={"content": content}
-            ) as response:
-
-                print(f"\nEdit Status: {response.status}")
-
-        except Exception as e:
-
-            print(f"\nEdit Error: {e}")
-
-    # =====================================================
-    # SEND FOUND USERNAME
-    # =====================================================
-
-    async def send_found_webhook(self, session, username):
-
-        payload = {
-            "content": (
-                f"## ✅ USERNAME FOUND\n\n"
-                f"**Username:** `{username}`\n"
-                f"**Checked:** `{self.stats.checked:,}`\n"
-                f"**Speed:** `{self.stats.checks_per_second():.2f}/sec`\n"
-                f"**Runtime:** `{self.stats.elapsed_time()}`\n"
-                f"**Length:** `{USERNAME_LENGTH}`\n"
-                f"**Time Found:** `{datetime.now()}`"
-            )
-        }
-
-        try:
-
-            async with session.post(
-                DROPS_WEBHOOK_URL,
-                json=payload
-            ) as response:
-
-                print(
-                    f"\nFound Webhook Status: "
-                    f"{response.status}"
-                )
-
-        except Exception as e:
-
-            print(f"\nFound Webhook Error: {e}")
-
-    # =====================================================
-    # CHECK USERNAME
-    # =====================================================
-
-    async def check_username(self, session, username):
-
-        payload = {
-            "username": username
-        }
-
-        retries = 0
-
-        while retries <= MAX_RETRIES and self.running:
-
+    async def update_stats(self):
+        while self.running:
             try:
+                msg = (
+                    f"## 📊 **DISCORD USERNAME SNIPER**\n\n"
+                    f"**Checked:** `{self.stats.checked:,}`\n"
+                    f"**Speed:** `{self.stats.cps():.1f}/s`\n"
+                    f"**Runtime:** `{self.stats.elapsed()}`\n"
+                    f"**Workers:** `{CONCURRENCY}` | **Length:** `{USERNAME_LENGTH}`"
+                )
 
-                async with session.post(
-                    API_URL,
-                    json=payload
-                ) as response:
+                print(f"\rChecked: {self.stats.checked:,} | {self.stats.cps():.1f}/s | {self.stats.elapsed()}", end="")
 
+                if self.webhook_message_id:
+                    await self.session.patch(
+                        f"{STATS_WEBHOOK_URL}/messages/{self.webhook_message_id}",
+                        json={"content": msg}
+                    )
+            except:
+                pass
+            await asyncio.sleep(3)
+
+    async def send_found(self, username):
+        payload = {
+            "content": f"""## ✅ **USERNAME FOUND!**
+
+**@{username}**
+
+**Checked:** `{self.stats.checked:,}`
+**Speed:** `{self.stats.cps():.1f}/s`
+**Time:** `{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}`"""
+        }
+        try:
+            await self.session.post(DROPS_WEBHOOK_URL, json=payload)
+        except Exception as e:
+            print(f"Drop webhook failed: {e}")
+
+    async def check_username(self, username: str):
+        for attempt in range(MAX_RETRIES + 1):
+            try:
+                async with self.session.post(API_URL, json={"username": username}, timeout=8) as resp:
                     self.stats.record_check()
 
-                    # CONSOLE STATS
-                    print(
-                        f"\rChecked: {self.stats.checked:,} | "
-                        f"Status: {response.status} | "
-                        f"Speed: "
-                        f"{self.stats.checks_per_second():.2f}/sec | "
-                        f"Runtime: "
-                        f"{self.stats.elapsed_time()}",
-                        end=""
-                    )
-
-                    # RATE LIMITED
-                    if response.status == 429:
-
-                        wait = BASE_BACKOFF * (2 ** retries)
-
-                        retries += 1
-
-                        await asyncio.sleep(wait)
-
+                    if resp.status == 429:
+                        retry_after = float((await resp.json()).get("retry_after", 1.5))
+                        await asyncio.sleep(retry_after * 1.2)
                         continue
 
-                    # BAD RESPONSE
-                    if response.status != 200:
-                        return False
+                    if resp.status != 200:
+                        await asyncio.sleep(0.3)
+                        continue
 
-                    data = await response.json()
+                    data = await resp.json()
+                    return not data.get("taken", True)
 
-                    taken = data.get("taken", True)
-
-                    return not taken
-
-            except Exception as e:
-
-                print(f"\nRequest Error: {e}")
-
-                self.stats.record_check()
-
-                retries += 1
-
-                await asyncio.sleep(
-                    BASE_BACKOFF * (2 ** retries)
-                )
+            except asyncio.TimeoutError:
+                await asyncio.sleep(0.5)
+            except Exception:
+                await asyncio.sleep(0.4 * (attempt + 1))
 
         return False
 
-    # =====================================================
-    # WORKER
-    # =====================================================
-
-    async def worker(self, session):
-
+    async def worker(self):
         while self.running:
+            try:
+                username = next(self.generator)
+                if username in self.tried:
+                    continue
 
-            username = self.generate_username()
+                self.tried.add(username)
+                self.save_progress(username)
 
-            if username in self.checked_usernames:
-                continue
+                if await self.check_username(username):
+                    print(f"\n\n🔥 FOUND: @{username} 🔥\n")
+                    with open(SAVE_FILE, "a") as f:
+                        f.write(f"{username} | {datetime.now()}\n")
 
-            self.checked_usernames.add(username)
+                    await self.send_found(username)
+                    self.stats.found += 1
+                    self.running = False
+                    break
 
-            available = await self.check_username(
-                session,
-                username
-            )
-
-            # =================================================
-            # TESTING MODE
-            # Uncomment this to fake-find usernames
-            # =================================================
-
-            # available = random.randint(1, 1000) == 1
-
-            if available:
-
-                print("\n" + "=" * 60)
-                print(
-                    f"FOUND AVAILABLE USERNAME: "
-                    f"{username}"
-                )
-                print("=" * 60)
-
-                with open(SAVE_FILE, "a") as f:
-
-                    f.write(
-                        f"{username} | "
-                        f"{datetime.now()}\n"
-                    )
-
-                await self.send_found_webhook(
-                    session,
-                    username
-                )
-
+            except StopIteration:
+                print("\nAll combinations exhausted!")
                 self.running = False
-
-                return
-
-    # =====================================================
-    # LIVE STATS LOOP
-    # =====================================================
-
-    async def stats_loop(self, session):
-
-        await self.create_webhook_message(session)
-
-        while self.running:
-
-            cps = self.stats.checks_per_second()
-
-            msg = (
-                f"## 📊 USERNAME CHECKER RUNNING\n\n"
-                f"**Checked:** `{self.stats.checked:,}`\n"
-                f"**Speed:** `{cps:.2f}/sec`\n"
-                f"**Runtime:** `{self.stats.elapsed_time()}`\n"
-                f"**Workers:** `{CONCURRENCY}`\n"
-                f"**Username Length:** `{USERNAME_LENGTH}`\n"
-                f"**Charset:** `{'letters+numbers' if USE_NUMBERS else 'letters only'}`"
-            )
-
-            # CONSOLE
-            console_msg = (
-                f"\r"
-                f"Checked: {self.stats.checked:,} | "
-                f"Speed: {cps:.2f}/sec | "
-                f"Runtime: {self.stats.elapsed_time()}"
-            )
-
-            sys.stdout.write(console_msg)
-            sys.stdout.flush()
-
-            # EDIT SAME WEBHOOK MESSAGE
-            await self.edit_webhook_message(
-                session,
-                msg
-            )
-
-            await asyncio.sleep(2)
-
-    # =====================================================
-    # MAIN RUNNER
-    # =====================================================
+                break
+            except Exception as e:
+                await asyncio.sleep(0.1)
 
     async def run(self):
-
         self.setup_signals()
+        print("="*70)
+        print("DISCORD USERNAME SNIPER v2 - Optimized")
+        print("="*70)
 
-        print("=" * 60)
-        print("Discord Username Checker")
-        print("=" * 60)
-
-        connector = aiohttp.TCPConnector(
-            limit=CONCURRENCY,
-            ssl=False
-        )
-
-        timeout = aiohttp.ClientTimeout(
-            total=10
-        )
-
-        headers = {
-            "User-Agent": (
-                "Mozilla/5.0 "
-                "(Windows NT 10.0; Win64; x64)"
-            )
-        }
+        connector = aiohttp.TCPConnector(limit=CONCURRENCY * 2, ssl=False, ttl_dns_cache=300)
+        timeout = aiohttp.ClientTimeout(total=15, sock_connect=8)
 
         async with aiohttp.ClientSession(
             connector=connector,
             timeout=timeout,
-            headers=headers
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
         ) as session:
+            self.session = session
+            await self.create_webhook_message()
 
-            workers = [
-                asyncio.create_task(
-                    self.worker(session)
-                )
-                for _ in range(CONCURRENCY)
-            ]
+            stats_task = asyncio.create_task(self.update_stats())
 
-            stats_task = asyncio.create_task(
-                self.stats_loop(session)
-            )
+            workers = [asyncio.create_task(self.worker()) for _ in range(CONCURRENCY)]
 
-            await asyncio.gather(
-                *workers,
-                stats_task,
-                return_exceptions=True
-            )
+            try:
+                await asyncio.gather(*workers, return_exceptions=True)
+            finally:
+                stats_task.cancel()
 
-# =========================================================
-# MAIN
-# =========================================================
+        print(f"\n\nFinished. Total checked: {self.stats.checked:,}")
+
 
 async def main():
-
     checker = UsernameChecker()
-
     await checker.run()
 
 if __name__ == "__main__":
-
     asyncio.run(main())

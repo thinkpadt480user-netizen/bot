@@ -1,239 +1,519 @@
+#!/usr/bin/env python3
+
 import asyncio
 import aiohttp
+import random
 import string
 import time
-import sys
 import signal
 from collections import deque
 from datetime import datetime
-from itertools import product
 
 # =========================================================
 # CONFIG
 # =========================================================
 
-CONCURRENCY = 250           # ← Increased
+CONCURRENCY = 100
 USERNAME_LENGTH = 4
 USE_NUMBERS = True
+
 SAVE_FILE = "found.txt"
-PROGRESS_FILE = "progress.txt"
 
 STATS_WEBHOOK_URL = "https://discord.com/api/webhooks/1506778294983327774/Gs4U0KXsTVblV9LQIt5X340KsxiNZtwvRU_ipeCzm0LeU1Q5ASrCyzM-98bFwGYy0tX5"
-DROPS_WEBHOOK_URL = "https://discord.com/api/webhooks/1506803035592986784/rtdrRvkPOzTQQCJOhi7zywWOIV7vrEMCAHzJA2EWk-uymDzEcU0cmfPxgzkQNGnd8hxJ"
+
+FOUND_WEBHOOK_URL = "https://discord.com/api/webhooks/1506803035592986784/rtdrRvkPOzTQQCJOhi7zywWOIV7vrEMCAHzJA2EWk-uymDzEcU0cmfPxgzkQNGnd8hxJ"
 
 API_URL = "https://discord.com/api/v9/unique-username/username-attempt-unauthed"
 
-MAX_RETRIES = 4
-BASE_BACKOFF = 0.6
+MAX_RETRIES = 5
+BASE_BACKOFF = 0.3
+
+# =========================================================
+# GLOBALS
+# =========================================================
+
+running = True
+checked_usernames = set()
+stats_message_id = None
+
+# =========================================================
+# CHARACTER SET
+# =========================================================
+
+if USE_NUMBERS:
+    CHARSET = string.ascii_lowercase + string.digits
+else:
+    CHARSET = string.ascii_lowercase
 
 # =========================================================
 # STATS
 # =========================================================
 
 class StatsTracker:
+
     def __init__(self):
+
         self.checked = 0
         self.start_time = time.time()
-        self.timestamps = deque(maxlen=2000)
+        self.timestamps = deque(maxlen=5000)
 
-    def record_check(self):
+    def record(self):
+
         self.checked += 1
         self.timestamps.append(time.time())
 
     def cps(self):
-        if len(self.timestamps) < 30:
-            return 0.0
-        elapsed = self.timestamps[-1] - self.timestamps[0]
-        return len(self.timestamps) / elapsed if elapsed > 0 else 0.0
 
-    def elapsed(self):
+        if len(self.timestamps) < 2:
+            return 0.0
+
+        elapsed = self.timestamps[-1] - self.timestamps[0]
+
+        if elapsed <= 0:
+            return 0.0
+
+        return len(self.timestamps) / elapsed
+
+    def uptime(self):
+
         secs = int(time.time() - self.start_time)
+
         h = secs // 3600
         m = (secs % 3600) // 60
         s = secs % 60
+
         return f"{h:02d}:{m:02d}:{s:02d}"
 
+stats = StatsTracker()
+
+# =========================================================
+# USERNAME GENERATOR
+# =========================================================
+
+def generate_username():
+
+    return ''.join(
+        random.choices(
+            CHARSET,
+            k=USERNAME_LENGTH
+        )
+    )
+
+# =========================================================
+# BANNER
+# =========================================================
+
+def banner():
+
+    total = len(CHARSET) ** USERNAME_LENGTH
+
+    print(r"""
+___.   .__                    .___ _____                
+\_ |__ |  |   ____   ____   __| _// ____\__________  ___
+ | __ \|  |  /  _ \ /  _ \ / __ |\   __\\___   /\  \/  /
+ | \_\ \  |_(  <_> |  <_> ) /_/ | |  |   /    /  >    < 
+ |___  /____/\____/ \____/\____ | |__|  /_____ \/__/\_ \
+     \/                        \/             \/      \/
+""")
+
+    print(f"[ SYSTEM ] TOTAL TARGETS : {total:,}\n")
+
+# =========================================================
+# SAVE
+# =========================================================
+
+def save_username(username):
+
+    with open(
+        SAVE_FILE,
+        "a",
+        encoding="utf-8"
+    ) as f:
+
+        f.write(
+            f"{username} | {datetime.now()}\n"
+        )
+
+# =========================================================
+# WEBHOOKS
+# =========================================================
+
+async def create_stats_message(session):
+
+    global stats_message_id
+
+    if not STATS_WEBHOOK_URL:
+        return
+
+    payload = {
+        "content": "# STARTING SESSION..."
+    }
+
+    try:
+
+        async with session.post(
+            STATS_WEBHOOK_URL + "?wait=true",
+            json=payload
+        ) as r:
+
+            if r.status == 200:
+
+                data = await r.json()
+
+                stats_message_id = data["id"]
+
+                print(
+                    f"\n[ WEBHOOK ] CREATED MESSAGE "
+                    f"{stats_message_id}"
+                )
+
+            else:
+
+                text = await r.text()
+
+                print(
+                    f"\n[ WEBHOOK ERROR ] "
+                    f"{r.status} | {text}"
+                )
+
+    except Exception as e:
+
+        print(
+            f"\n[ WEBHOOK ERROR ] {e}"
+        )
+
+async def update_stats_webhook(session):
+
+    global stats_message_id
+
+    while running:
+
+        try:
+
+            if not stats_message_id:
+                await asyncio.sleep(1)
+                continue
+
+            payload = {
+                "content":
+                    f"# LIVE SESSION\n\n"
+                    f"CHECKED : `{stats.checked:,}`\n"
+                    f"SPEED : `{stats.cps():.1f}/s`\n"
+                    f"UPTIME : `{stats.uptime()}`\n"
+                    f"WORKERS : `{CONCURRENCY}`"
+            }
+
+            async with session.patch(
+                f"{STATS_WEBHOOK_URL}/messages/{stats_message_id}",
+                json=payload
+            ) as r:
+
+                if r.status not in [200, 204]:
+
+                    text = await r.text()
+
+                    print(
+                        f"\n[ STATS UPDATE ERROR ] "
+                        f"{r.status} | {text}"
+                    )
+
+        except Exception as e:
+
+            print(
+                f"\n[ STATS UPDATE ERROR ] {e}"
+            )
+
+        await asyncio.sleep(15)
+
+async def send_found_webhook(session, username):
+
+    if not FOUND_WEBHOOK_URL:
+        return
+
+    payload = {
+        "content":
+            f"# AVAILABLE USERNAME\n\n"
+            f"`@{username}`\n\n"
+            f"CHECKED : `{stats.checked:,}`"
+    }
+
+    try:
+
+        await session.post(
+            FOUND_WEBHOOK_URL,
+            json=payload
+        )
+
+        print(
+            f"\n[ DROPS ] SENT @{username}"
+        )
+
+    except Exception as e:
+
+        print(
+            f"\n[ FOUND WEBHOOK ERROR ] {e}"
+        )
 
 # =========================================================
 # CHECKER
 # =========================================================
 
-class UsernameChecker:
-    def __init__(self):
-        self.running = True
-        self.stats = StatsTracker()
-        self.webhook_message_id = None
-        self.session = None
+async def check_username(session, username):
 
-        self.charset = string.ascii_lowercase + (string.digits if USE_NUMBERS else "")
-        total = len(self.charset) ** USERNAME_LENGTH
-        print(f"Charset: {len(self.charset)} chars | Total usernames: {total:,}")
+    payload = {
+        "username": username
+    }
 
-        self.generator = self.username_generator()
-        self.tried = self.load_progress()   # Keep for resume
+    retries = 0
 
-    def username_generator(self):
-        for combo in product(self.charset, repeat=USERNAME_LENGTH):
-            yield ''.join(combo)
+    while retries <= MAX_RETRIES and running:
 
-    def load_progress(self):
         try:
-            with open(PROGRESS_FILE, "r") as f:
-                return set(line.strip() for line in f if line.strip())
-        except FileNotFoundError:
-            return set()
 
-    def save_progress(self, username):
-        with open(PROGRESS_FILE, "a") as f:
-            f.write(username + "\n")
+            async with session.post(
+                API_URL,
+                json=payload
+            ) as response:
 
-    def setup_signals(self):
-        def stop(*_):
-            self.running = False
-            print("\n\nStopping... Progress saved.")
-        signal.signal(signal.SIGINT, stop)
+                stats.record()
 
-    async def create_webhook_message(self):
-        try:
-            payload = {"content": "## 🚀 **USERNAME SNIPER STARTED**"}
-            async with self.session.post(STATS_WEBHOOK_URL + "?wait=true", json=payload) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    self.webhook_message_id = data.get("id")
-        except Exception as e:
-            print(f"Webhook init failed: {e}")
+                if response.status == 429:
 
-    async def update_webhook(self):
-        while self.running:
-            try:
-                msg = (
-                    f"## 📊 **USERNAME SNIPER RUNNING**\n\n"
-                    f"**Checked:** `{self.stats.checked:,}`\n"
-                    f"**Speed:** `{self.stats.cps():.1f}/s`\n"
-                    f"**Runtime:** `{self.stats.elapsed()}`\n"
-                    f"**Workers:** `{CONCURRENCY}` | **Length:** `{USERNAME_LENGTH}`"
-                )
-                if self.webhook_message_id:
-                    await self.session.patch(
-                        f"{STATS_WEBHOOK_URL}/messages/{self.webhook_message_id}",
-                        json={"content": msg}
+                    retry_after = BASE_BACKOFF * (
+                        2 ** retries
                     )
-            except:
-                pass
-            await asyncio.sleep(3)
 
-    async def check_username(self, username: str):
-        for attempt in range(MAX_RETRIES + 1):
-            try:
-                async with self.session.post(
-                    API_URL, 
-                    json={"username": username}, 
-                    timeout=aiohttp.ClientTimeout(total=8)
-                ) as resp:
-                    
-                    self.stats.record_check()
+                    await asyncio.sleep(retry_after)
 
-                    if resp.status == 429:
-                        try:
-                            data = await resp.json()
-                            await asyncio.sleep(data.get("retry_after", 1.0) * 1.15)
-                        except:
-                            await asyncio.sleep(1.0)
-                        continue
+                    retries += 1
 
-                    if resp.status != 200:
-                        await asyncio.sleep(0.08)
-                        continue
-
-                    data = await resp.json()
-                    return not data.get("taken", True)
-
-            except Exception:
-                await asyncio.sleep(0.12)
-
-        return False
-
-    async def worker(self):
-        while self.running:
-            try:
-                username = next(self.generator)
-                
-                if username in self.tried:
                     continue
 
-                self.tried.add(username)
-                self.save_progress(username)
+                if response.status != 200:
+                    return False
 
-                available = await self.check_username(username)
+                try:
 
-                if available:
-                    print(f"\n\n🔥 FOUND AVAILABLE: @{username} 🔥\n")
-                    with open(SAVE_FILE, "a") as f:
-                        f.write(f"{username} | {datetime.now()}\n")
-                    
-                    await self.send_found(username)
-                    self.running = False
-                    break
+                    data = await response.json()
 
-            except StopIteration:
-                print("\nAll combinations exhausted!")
-                self.running = False
-                break
-            except:
-                await asyncio.sleep(0.005)
+                except Exception:
 
-    async def send_found(self, username):
-        payload = {
-            "content": f"""## ✅ **USERNAME FOUND!**
+                    return False
 
-**@{username}**
+                taken = data.get("taken")
 
-**Checked:** `{self.stats.checked:,}`
-**Speed:** `{self.stats.cps():.1f}/s`
-**Runtime:** `{self.stats.elapsed()}`"""
-        }
+                if taken is False:
+                    return True
+
+                return False
+
+        except aiohttp.ClientError:
+
+            retry_after = BASE_BACKOFF * (
+                2 ** retries
+            )
+
+            await asyncio.sleep(retry_after)
+
+            retries += 1
+
+        except asyncio.CancelledError:
+
+            return False
+
+        except Exception:
+
+            return False
+
+    return False
+
+# =========================================================
+# WORKER
+# =========================================================
+
+async def worker(session, wid):
+
+    global running
+
+    while running:
+
         try:
-            await self.session.post(DROPS_WEBHOOK_URL, json=payload)
-        except:
-            pass
 
-    async def run(self):
-        self.setup_signals()
-        print("=" * 80)
-        print("DISCORD USERNAME SNIPER v2.3 - HIGH PERFORMANCE")
-        print("=" * 80)
+            username = generate_username()
 
-        connector = aiohttp.TCPConnector(
-            limit=CONCURRENCY * 4,
-            ssl=False,
-            keepalive_timeout=30,
-            ttl_dns_cache=300
+            if username in checked_usernames:
+                continue
+
+            checked_usernames.add(username)
+
+            available = await check_username(
+                session,
+                username
+            )
+
+            if available:
+
+                print(
+                    f"\n"
+                    f"========================================\n"
+                    f"USERNAME AVAILABLE : @{username}\n"
+                    f"========================================\n"
+                )
+
+                save_username(username)
+
+                await send_found_webhook(
+                    session,
+                    username
+                )
+
+        except asyncio.CancelledError:
+
+            return
+
+        except Exception as e:
+
+            print(
+                f"[ WORKER {wid} ] {e}"
+            )
+
+# =========================================================
+# LIVE STATS
+# =========================================================
+
+async def live_stats():
+
+    while running:
+
+        print(
+            f"\r"
+            f"[ LIVE ] "
+            f"CHECKED : {stats.checked:,} | "
+            f"SPEED : {stats.cps():.1f}/s | "
+            f"UPTIME : {stats.uptime()} | "
+            f"WORKERS : {CONCURRENCY}      ",
+            end=""
         )
 
-        async with aiohttp.ClientSession(
-            connector=connector,
-            timeout=aiohttp.ClientTimeout(total=12, sock_connect=6),
-            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-        ) as session:
-            
-            self.session = session
-            await self.create_webhook_message()
+        await asyncio.sleep(1)
 
-            webhook_task = asyncio.create_task(self.update_webhook())
-            workers = [asyncio.create_task(self.worker()) for _ in range(CONCURRENCY)]
+# =========================================================
+# SIGNALS
+# =========================================================
 
-            try:
-                await asyncio.gather(*workers, return_exceptions=True)
-            finally:
-                webhook_task.cancel()
+def setup_signals():
 
-        print(f"\nFinished. Total checked: {self.stats.checked:,}")
+    global running
 
+    def stop(*_):
+
+        running = False
+
+        print(
+            "\n[ SYSTEM ] TERMINATING SESSION"
+        )
+
+    signal.signal(signal.SIGINT, stop)
+
+# =========================================================
+# MAIN
+# =========================================================
 
 async def main():
-    checker = UsernameChecker()
-    await checker.run()
 
+    global running
+
+    setup_signals()
+
+    banner()
+
+    connector = aiohttp.TCPConnector(
+        limit=0,
+        limit_per_host=0,
+        ssl=False,
+        ttl_dns_cache=300,
+        keepalive_timeout=120,
+        enable_cleanup_closed=True
+    )
+
+    timeout = aiohttp.ClientTimeout(
+        total=4,
+        connect=2,
+        sock_connect=2,
+        sock_read=2
+    )
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/136.0.0.0 Safari/537.36"
+        )
+    }
+
+    async with aiohttp.ClientSession(
+        connector=connector,
+        timeout=timeout,
+        headers=headers
+    ) as session:
+
+        await create_stats_message(session)
+
+        workers = [
+
+            asyncio.create_task(
+                worker(session, i)
+            )
+
+            for i in range(CONCURRENCY)
+
+        ]
+
+        stats_task = asyncio.create_task(
+            live_stats()
+        )
+
+        webhook_stats_task = asyncio.create_task(
+            update_stats_webhook(session)
+        )
+
+        try:
+
+            await asyncio.gather(*workers)
+
+        except KeyboardInterrupt:
+
+            running = False
+
+        finally:
+
+            stats_task.cancel()
+            webhook_stats_task.cancel()
+
+            for task in workers:
+                task.cancel()
+
+            await asyncio.gather(
+                *workers,
+                return_exceptions=True
+            )
+
+    print(
+        "\n[ SYSTEM ] SESSION CLOSED"
+    )
+
+# =========================================================
+# ENTRY
+# =========================================================
 
 if __name__ == "__main__":
-    asyncio.run(main())
+
+    try:
+
+        asyncio.run(main())
+
+    except KeyboardInterrupt:
+
+        print(
+            "\n[ SYSTEM ] STOPPED BY USER"
+        )
